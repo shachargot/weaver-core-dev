@@ -85,6 +85,7 @@ def get_model(data_config, **kwargs):
     # set special args
     model.num_nodes = num_nodes
     model.num_cls_nodes = num_cls_nodes
+    model.label_cls_nodes = label_cls_nodes
     model.eval_kw = eval_kw
     model.num_unifd = len(reg_kw.get('composed_split_reg', []))
     model.as_resid_of = reg_kw.get('as_resid_of', None)
@@ -175,8 +176,8 @@ class ComposedHybridLoss(torch.nn.Module):
         loss_cls = self.loss_cls_fn(input_cls, target_cls)
 
         # regression inputs
-        input_reg_unifd = valid_input_reg[:, :self.num_unifd]
-        input_reg_split = valid_input_reg[:, self.num_unifd:]
+        input_reg_unifd = input_reg[:, :self.num_unifd]
+        input_reg_split = input_reg[:, self.num_unifd:]
 
         # compute unified regression loss
         n_target_reg = target_reg.shape[1]
@@ -473,7 +474,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                         eval_metrics_cls=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],
                         eval_metrics_reg=['mean_squared_error', 'mean_absolute_error', 'median_absolute_error',
                                           'mean_gamma_deviance'],
-                        tb_helper=None):
+                        tb_helper=None, collect_per_class_reg_loss=True):
     model.eval()
 
     data_config = test_loader.dataset.config
@@ -501,10 +502,9 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
     label_cls_array = []
     eval_kw = model.module.eval_kw \
         if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model.eval_kw
-    collect_reg_plots = (tb_helper is not None) and for_training and len(data_config.label_names) > 1
-    pt_obs_name = 'scoutfj_gen_pt'
-    jet_mass_obs_name = 'scoutfj_mass'
-    reg_pred_list, reg_true_list, cls_true_list, pt_list, jet_mass_list = [], [], [], [], []
+    collect_per_class_reg_loss = collect_per_class_reg_loss and (loss_func is not None) and (tb_helper is not None)
+    if collect_per_class_reg_loss:
+        pc_logits_list, pc_preds_reg_list, pc_label_cls_list, pc_label_reg_list = [], [], [], []
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y, Z in tq:
@@ -536,15 +536,12 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
 
                 logits = model_output[:, :n_cls].float()
                 preds_reg = model_output[:, n_cls:].float()
-
-                if collect_reg_plots:
-                    reg_pred_list.append(preds_reg.detach().cpu().numpy())
-                    reg_true_list.append(label_reg.detach().cpu().numpy())
-                    cls_true_list.append(label_cls.detach().cpu().numpy())
-                    if pt_obs_name in Z:
-                        pt_list.append(Z[pt_obs_name].cpu().numpy().reshape(-1))
-                    if jet_mass_obs_name in Z:
-                        jet_mass_list.append(Z[jet_mass_obs_name].cpu().numpy().reshape(-1))
+    
+                if collect_per_class_reg_loss and label_reg is not None:
+                    pc_logits_list.append(logits.detach())
+                    pc_preds_reg_list.append(preds_reg.detach())
+                    pc_label_cls_list.append(label_cls.detach())
+                    pc_label_reg_list.append(label_reg.detach())
 
                 if not for_training:
                     scores_cls.append(torch.softmax(logits, dim=1).detach().cpu().numpy())
@@ -560,7 +557,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                     labels['truth_label'].append(y['truth_label'].cpu().numpy())
 
                 _, preds_cls = logits.max(1)
-                if for_training:
+                if loss_func is not None and label_reg is not None:
                     loss, loss_monitor = loss_func(logits, preds_reg, label_cls, label_reg)
                     loss = loss.item()
                 else:
@@ -576,7 +573,7 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
                 if 'reg_split' in loss_monitor:
                     total_loss_reg_split += loss_monitor['reg_split'] * num_examples
                     total_loss_reg_unifd += loss_monitor['reg_unifd'] * num_examples
-                elif n_reg_target > 1 and for_training:
+                elif n_reg_target > 1 and 'reg_0' in loss_monitor:
                     for i in range(n_reg_target):
                         total_loss_reg_i[i] += loss_monitor[f'reg_{i}'] * num_examples
 
@@ -616,9 +613,11 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
     time_diff = time.time() - start_time
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info('Evaluation class distribution: \n    %s', str(sorted(label_counter.items())))
+    _logger.info('Avg cls loss: %.5f, Avg reg loss: %.5f, Avg total loss: %.5f' %
+             (total_loss_cls / count, total_loss_reg / count, total_loss / count))
 
+    tb_mode = 'eval' if for_training else 'test'
     if tb_helper:
-        tb_mode = 'eval' if for_training else 'test'
         tb_helper.write_scalars([
             ("Loss/%s (epoch)" % tb_mode, total_loss_cls / count, epoch),
             ("LossReg/%s (epoch)" % tb_mode, total_loss_reg / count, epoch),
@@ -627,42 +626,6 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
             # ("MSE/%s (epoch)" % tb_mode, sum_sqr_err / count, epoch),
             # ("MAE/%s (epoch)" % tb_mode, sum_abs_err / count, epoch),
             ])
-        if collect_reg_plots and len(reg_pred_list) > 0:
-            roc_kw = eval_kw.get('roc_kw', None)
-            groups = {
-                'Upsilon3g': [0],
-                'UpsilonTauHTauH': [1],
-            #     'QCD': [2],
-            }
-            write_mass_reg_plots(
-                tb_helper, tb_mode, epoch,
-                pred=np.concatenate(reg_pred_list),
-                true=np.concatenate(reg_true_list),
-                cls=np.concatenate(cls_true_list),
-                target_names=data_config.label_names[1:],
-                groups=groups,
-            )
-        if collect_reg_plots and len(pt_list) == len(reg_pred_list) and len(pt_list) > 0:
-            write_mass_reg_vs_pt_plots(
-                tb_helper, tb_mode, epoch,
-                pred=np.concatenate(reg_pred_list),
-                true=np.concatenate(reg_true_list),
-                cls=np.concatenate(cls_true_list),
-                pt=np.concatenate(pt_list),
-                jet_mass=np.concatenate(jet_mass_list),
-                target_names=data_config.label_names[1:],
-                groups=groups,
-            )
-        if collect_reg_plots and len(pt_list) == len(reg_pred_list) == len(jet_mass_list) > 0:
-            write_pred_mass_vs_pt_plots(
-                tb_helper, tb_mode, epoch,
-                pred_factor=np.concatenate(reg_pred_list)[:, 0],
-                true_factor=np.concatenate(reg_true_list)[:, 0],
-                pt=np.concatenate(pt_list),
-                jet_mass=np.concatenate(jet_mass_list),
-                cls=np.concatenate(cls_true_list),
-                groups=groups,
-            )
         if 'reg_split' in loss_monitor:
             tb_helper.write_scalars([
                 ("LossRegSplit/%s (epoch)" % tb_mode, total_loss_reg_split / count, epoch),
@@ -676,6 +639,38 @@ def evaluate_hybrid(model, test_loader, dev, epoch, for_training=True, loss_func
         if tb_helper.custom_fn:
             with torch.no_grad():
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)
+
+    # --- per-class regression loss ---
+    if collect_per_class_reg_loss and len(pc_label_cls_list) > 0:
+        all_logits = torch.cat(pc_logits_list, dim=0)
+        all_preds_reg = torch.cat(pc_preds_reg_list, dim=0)
+        all_label_cls = torch.cat(pc_label_cls_list, dim=0)
+        all_label_reg = torch.cat(pc_label_reg_list, dim=0)
+
+        m = model.module if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model
+        cls_names = getattr(m, 'label_cls_nodes', None)
+
+        scalars = []
+        for cls_val in sorted(all_label_cls.unique().tolist()):
+            mask = all_label_cls == cls_val
+            n = mask.sum().item()
+            if n == 0:
+                continue
+            _, pc_loss_dict = loss_func(
+                all_logits[mask], all_preds_reg[mask],
+                all_label_cls[mask], all_label_reg[mask])
+
+            cls_name = cls_names[cls_val] if cls_names is not None and cls_val < len(cls_names) else str(cls_val)
+            base = 'RegLossPerClass/%s' % cls_name
+            scalars.append(('%s/reg_unifd (%s)' % (base, tb_mode), pc_loss_dict['reg_unifd'], epoch))
+            if 'reg_split' in pc_loss_dict:
+                scalars.append(('%s/reg_split (%s)' % (base, tb_mode), pc_loss_dict['reg_split'], epoch))
+            scalars.append(('%s/reg (%s)' % (base, tb_mode), pc_loss_dict['reg'], epoch))
+            scalars.append(('%s/n_events (%s)' % (base, tb_mode), n, epoch))
+
+        tb_helper.write_scalars(scalars)
+        del all_logits, all_preds_reg, all_label_cls, all_label_reg, pc_logits_list, pc_preds_reg_list, pc_label_cls_list, pc_label_reg_list
+
     ## a temporary hack: save the embeded space
     # tb_helper.writer.add_embedding(np.concatenate(model_embed_output_array), metadata=[data_config.label_value_cls_names[val].replace('label_','') for val in np.concatenate(label_cls_array)], tag='embed')
 
